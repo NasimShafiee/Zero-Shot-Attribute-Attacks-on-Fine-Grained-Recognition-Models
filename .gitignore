@@ -1,0 +1,63 @@
+#Coompiled source #
+###################
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+
+# Packages #
+############
+# it's better to unpack these files and commit the raw source
+# git has its own built in compression methods
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+*.tgz
+
+# Logs and databases #
+######################
+*.log
+*.sql
+*.sqlite
+*.txt
+*.hdf5
+*.jpg
+*.png
+*.jpeg
+*.pkl
+*.mat
+*.m
+*/data/*
+*.pt
+*/data*
+*.csv
+*.html
+*results
+#!*.ipynb*
+*checkpoint*
+*.pyc
+*-Copy*
+*Untitled*
+*trash*
+*temp*
+# OS generated files #
+######################
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+
+# tensorboard logs
+*tfevents*
+

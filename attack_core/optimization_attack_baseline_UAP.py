@@ -1,0 +1,468 @@
+from typing_extensions import final
+import torch
+from torch.functional import norm 
+from torch.utils.tensorboard import SummaryWriter
+import torchvision
+from torchray.attribution.guided_backprop import GuidedBackpropContext
+import torch.nn.functional as F
+import skimage.transform
+import skimage
+import matplotlib.pyplot as plt
+import seaborn as sns
+import networkx as nx
+import time
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import torch.nn as nn
+import scipy
+import attack_core.deepfool as deepfool
+import sys
+from global_setting import NFS_path_AoA,save_NFS
+
+sys.path.insert(1,'/mnt/raptor/nasim/early_stopping/early-stopping-pytorch')
+from pytorchtools import EarlyStopping
+
+# Transform and Inverse Transform
+input_size = 224
+transform = torchvision.transforms.Compose([
+        torchvision.transforms.Resize(input_size),
+        torchvision.transforms.CenterCrop(input_size),
+        torchvision.transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+inverse_transform = torchvision.transforms.Compose([
+            torchvision.transforms.Normalize(mean=[0.,0.,0.], std=[1/0.229, 1/0.224, 1/0.225]),\
+            torchvision.transforms.Normalize(mean=[-0.485, -0.456, -0.406], std=[1.,1.,1.])
+])
+
+min_t = transform(torch.zeros(1,3,224,224)).min()
+max_t = transform(torch.ones(1,3,224,224)).max()
+
+def project_perturbation_func(data_point,p,perturbation  ):
+
+    if p == 2:
+        perturbation = perturbation * min(1, data_point / torch.linalg.norm(perturbation.flatten(1)))
+    elif p == np.inf:
+        perturbation = torch.sign(perturbation) * torch.minimum(torch.abs(perturbation), torch.tensor(data_point))
+    return perturbation
+
+# Universal Generation and Attack
+class universal_end2end_attack(torch.nn.Module):
+    def __init__(self, num_attributes, num_classes, image_size, w2v_size, dataset, w_as="function",\
+                                        device=torch.device("cpu"), learning_rate=0.001, log_folder="./log_baselines/", log_title="_", if_dropout=False):
+
+        super(universal_end2end_attack, self).__init__()
+
+        self.e           = torch.zeros(1,\
+                                       image_size[0], image_size[1],\
+                                       image_size[2], device=device)
+        self.num_classes = num_classes
+        
+        # self.optimizer  = torch.optim.Adam([self.e], lr=learning_rate)
+
+
+        self.device     = device
+        
+        self.logger     = SummaryWriter(log_folder+log_title)
+
+        if dataset=="CUB":
+            self.attr_names = pd.read_csv(NFS_path_AoA+'data/CUB/CUB_200_2011/attributes.txt', delimiter=" ", header=None, names=["num","name"]).drop(axis=1,columns="num")
+            self.class_names= pd.read_csv(NFS_path_AoA+'data/xlsa17/data/CUB/allclasses.txt',    delimiter=".", header=None, names=["num","name"]).drop(axis=1,columns="num")
+        elif dataset=="AWA2":
+            self.attr_names = pd.read_csv(NFS_path_AoA+'data/AWA2/Animals_with_Attributes2/predicates.txt', delimiter="\t", header=None, names=["num","name"]).drop(axis=1,columns="num")
+            self.class_names= pd.read_csv(NFS_path_AoA+'data/AWA2/Animals_with_Attributes2/classes.txt',    delimiter="\t", header=None, names=["num","name"]).drop(axis=1,columns="num")
+        elif dataset=="APY":
+            self.attr_names = pd.read_csv(NFS_path_AoA+'data/APY/attribute_data/attribute_names.txt', header=None, names=["name"])
+            self.class_names= pd.read_csv(NFS_path_AoA+'data/APY/attribute_data/class_names.txt', header=None, names=["name"])
+        elif dataset=="SUN":
+            mat             = scipy.io.loadmat(NFS_path_AoA+'data/SUN/attributes.mat')
+            attr_names      = [mat["attributes"][:,0][i][0] for i in range(len(mat["attributes"]))]
+            self.attr_names = pd.DataFrame(attr_names,columns=["name"])
+
+            mat=scipy.io.loadmat(NFS_path_AoA+"data/xlsa17/data/SUN/att_splits.mat")
+            class_names =[mat["allclasses_names"][:,0][i][0] for i in range(len(mat["allclasses_names"]))]
+            self.class_names = pd.DataFrame(class_names,columns=["name"])
+
+        
+        # torch.nn.init.uniform_(self.e, a=0.00001, b=0.001)
+    
+    
+    
+    def attribute_score(self, model, batch_image):    
+        pred        = model(batch_image)
+        pred        = torch.argmax(pred, 1)
+        attr_score  = model.dazle.package_out['A_p'] * model.dazle.package_out['S_p']
+        return attr_score, pred
+    
+    
+    
+    def log_function(self, iter, loss, loss_1, loss_2):
+        self.logger.add_scalar('Loss/train', loss, iter)
+        self.logger.add_scalar('Loss1/train', loss_1, iter)
+        self.logger.add_scalar('Loss2/train', loss_2, iter)
+        
+        if iter%10==0:
+            img_grid = torchvision.utils.make_grid(self.e)
+            self.logger.add_image('universals per attribute', img_grid, iter)
+    
+    
+    
+    def loss_adversraial_condition(self, final_adv_scores, corr_batch_label, confidence):
+        # Find first max but not the correct label (y_i!=j)
+        other_class_max_score, other_class = torch.topk(final_adv_scores, 2, dim=-1, largest=True)            
+        second_max_index = torch.nonzero(other_class != corr_batch_label)
+        list = []
+        list.append(second_max_index[0])
+        for i in range(1,second_max_index.size(0)):
+            if second_max_index[i-1,0]!=second_max_index[i,0]:
+                list.append(second_max_index[i])
+        second_max_index = torch.stack(list)
+        
+        second_max_class = other_class[second_max_index[:,0],second_max_index[:,1]]
+        second_max_score = other_class_max_score[second_max_index[:,0],second_max_index[:,1]]
+        
+        final_adv_index  = torch.cat([torch.arange(corr_batch_label.size(0), device=self.device).unsqueeze(1),\
+                                    corr_batch_label], dim=1)
+        
+        final_adv_scores = final_adv_scores[final_adv_index[:,0], final_adv_index[:,1]]
+
+        S_yi     = final_adv_scores
+        max_S_j  = second_max_score
+        loss     = torch.einsum("b,b->b", ((S_yi - max_S_j + confidence) > 0),\
+                                           (S_yi - max_S_j + confidence)).sum()
+        
+        return loss
+
+
+
+    def add_perturbation(self, normalized_batch_image, perturbation, normalized_perturbation=True, project_perturbation=False, scale=True, norm_p=1, norm_perturbation=1):
+        if normalized_perturbation:
+
+            if scale:# Scale Perturbation
+                perturbation = transform(self.scale_perturbation(inverse_transform(perturbation), norm_p, norm_perturbation))
+
+            if project_perturbation:
+                adv_batch_image = torch.clamp(normalized_batch_image + perturbation,\
+                                              min=min_t, max=max_t)
+            else:
+                adv_batch_image = normalized_batch_image + perturbation
+                
+        else:
+            if scale:# Scale Perturbation
+                perturbation = self.scale_perturbation(perturbation, norm_p, norm_perturbation)
+
+            batch_image     = inverse_transform(normalized_batch_image)
+            if project_perturbation:
+                adv_batch_image = transform(torch.clamp(batch_image + perturbation,\
+                                            min=0, max=1))
+            else:
+                adv_batch_image = transform(batch_image + perturbation)
+
+        return adv_batch_image
+    
+
+
+    def scale_perturbation(self, perturbation, norm_p, perturbation_scale):
+
+        if norm_p==2:
+            # Magnitude of Perturbations
+            norm_p_img   = torch.norm(perturbation,p=norm_p,dim=(1,2,3)).mean()
+
+            # Scaling Perturbations
+            scale_l = torch.tensor(perturbation_scale)
+            ratio_l = norm_p_img/scale_l
+            perturbation_scaled = perturbation/ratio_l
+
+        else:
+
+            norm_p_img = torch.norm(perturbation.reshape(-1,3,224,224),p=float('inf'),dim=(2,3)).reshape(-1,3,1,1)
+            scale_l = torch.tensor(perturbation_scale)
+            ratio_l = norm_p_img/scale_l
+            perturbation_scaled = perturbation/ratio_l
+
+
+        
+        return perturbation_scaled
+
+
+
+    def image_visualization(self, images, perturbations, adv_images, adv_title, cln_title, attack_scenario, norm_perturbation, norm_p):
+        fig, axs = plt.subplots(9, np.ceil(images.size(0)/3).astype(int),figsize=(90,50))
+        if np.ceil(images.size(0)/3).astype(int)>1:
+            for i in range(images.size(0)):
+                axs[0+3*(i%3),i//3].imshow(images[i].squeeze().detach().clone().cpu().permute(1,2,0).numpy())
+                axs[1+3*(i%3),i//3].imshow(perturbations[i].squeeze().detach().clone().cpu().permute(1,2,0).numpy())
+                axs[2+3*(i%3),i//3].imshow(adv_images[i].squeeze().detach().clone().cpu().permute(1,2,0).numpy())
+                axs[0+3*(i%3),i//3].set_title(cln_title[i])
+                axs[2+3*(i%3),i//3].set_title(adv_title[i])
+                axs[0+3*(i%3),i//3].axes.xaxis.set_visible(False)
+                axs[0+3*(i%3),i//3].axes.yaxis.set_visible(False)
+                axs[1+3*(i%3),i//3].axes.xaxis.set_visible(False)
+                axs[1+3*(i%3),i//3].axes.yaxis.set_visible(False)
+                axs[2+3*(i%3),i//3].axes.xaxis.set_visible(False)
+                axs[2+3*(i%3),i//3].axes.yaxis.set_visible(False)
+        else:
+            for i in range(images.size(0)):
+                axs[0+3*(i%3)].imshow(images[i].squeeze().detach().clone().cpu().permute(1,2,0).numpy())
+                axs[1+3*(i%3)].imshow(perturbations[i].squeeze().detach().clone().cpu().permute(1,2,0).numpy())
+                axs[2+3*(i%3)].imshow(adv_images[i].squeeze().detach().clone().cpu().permute(1,2,0).numpy())
+                axs[0+3*(i%3)].set_title(cln_title[i])
+                axs[2+3*(i%3)].set_title(adv_title[i])
+                axs[0+3*(i%3)].axes.xaxis.set_visible(False)
+                axs[0+3*(i%3)].axes.yaxis.set_visible(False)
+                axs[1+3*(i%3)].axes.xaxis.set_visible(False)
+                axs[1+3*(i%3)].axes.yaxis.set_visible(False)
+                axs[2+3*(i%3)].axes.xaxis.set_visible(False)
+                axs[2+3*(i%3)].axes.yaxis.set_visible(False)
+        fig.tight_layout()
+        self.logger.add_figure('attack/'+attack_scenario+str(norm_perturbation)+'_'+str(norm_p.item()), fig)
+
+
+
+    ####################################################################
+    ###              Train the Universals                            ###
+    ####################################################################
+
+    def forward(self, model, dataloader, dataloader_val, semantic_vector, batch_size, confidence, num_epochs=10, loss_norm=2, norm_perturbation=1, loss_coefficient=10, normalized_perturbation=True, project_perturbation=False, checkpoint_path="./"):
+        # Initialize Variables
+        norm_p =loss_norm
+        dataset_length      = len(dataloader['images'])
+        dataset_length_val  = len(dataloader_val['images'])
+        iter=0
+        
+        early_stopping = EarlyStopping(patience=20, verbose=True, path=checkpoint_path)
+
+        fooling_rate=0
+        delta=0.2
+        max_iter_uni=10#np.inf
+        xi=10
+        p=2 if norm_p==2 else np.inf
+        num_classes=self.num_classes
+        overshoot=0.02
+        max_iter_df=10
+        # v=np.zeros([28,28])
+
+        while fooling_rate < 1-delta and iter < max_iter_uni:
+
+            for i in range(0, dataset_length, 1): 
+                if i%200==0: print(i,' / ',dataset_length)
+                batch_label   = dataloader['labels'][i].to(self.device).unsqueeze(0)
+                batch_image   = dataloader['images'][i].to(self.device).unsqueeze(0)
+
+                # Calculate Unique Adversarial Perturbations 
+                # self.e = torch.tensor(v).to(self.device)
+
+                # Calculate attribute scores
+                # attribute_score, c = self.attribute_score(model, batch_image)
+
+                # Create Perturbations for the batch
+                adv_batch_image    = batch_image + self.e.reshape(batch_image.size())
+                attribute_score_adv, c_adv = self.attribute_score(model, adv_batch_image)
+
+                # If the label of both images is the same, the perturbation v needs to be updated
+                if batch_label == c_adv:
+                    # Finding a new minimal perturbation with deepfool to fool the network on this image
+                    dr, iter_k, label, k_i, pert_image = deepfool.deepfool(adv_batch_image.squeeze(), model, num_classes=self.num_classes, overshoot=overshoot, max_iter=max_iter_df)
+
+                    # Adding the new perturbation found and projecting the perturbation v and data point xi on p.
+                    if iter_k < max_iter_df-1:
+                        self.e += torch.tensor(dr,device=self.device)
+                        self.e = project_perturbation_func( xi, p,self.e)
+                        img_grid = torchvision.utils.make_grid(self.e)
+                        self.logger.add_image('universals per attribute', img_grid, iter*dataset_length+i)
+
+            iter = iter + 1
+
+            total_num_image=0
+            total_fools=0
+            
+            with torch.no_grad():
+            
+                for i in range(0, dataset_length_val, batch_size):
+                
+                    batch_label   = dataloader_val['labels'][i:i+batch_size].to(self.device)
+                    batch_image   = dataloader_val['images'][i:i+batch_size].to(self.device)
+
+                    # Calculate attribute scores
+                    attribute_score, c = self.attribute_score(model, batch_image)
+                
+                    # self.e = torch.tensor(v).to(self.device)
+                    
+                    adv_batch_image    = batch_image + self.e
+                    attribute_score_adv, c_adv = self.attribute_score(model, adv_batch_image)
+
+                    foolish_predicted = (c_adv != c).sum()
+
+                    total_num_image += batch_size
+
+                    total_fools +=foolish_predicted
+                
+                fooling_rate = total_fools/total_num_image
+
+
+                print("iter ", iter,"fooling rate",fooling_rate)
+                self.logger.add_scalar('fooling rate',fooling_rate, iter)
+                img_grid = torchvision.utils.make_grid(self.e)
+                self.logger.add_image('universals per attribute', img_grid, iter)
+                
+            return
+
+
+
+
+        
+    def attack_with_universals(self, model, dataloader, semantic_vector, w2v_vector,\
+                               batch_size, norm_perturbation=1, norm_p=1, attack_scenario="seen", normalized_perturbation=True, project_perturbation=False):
+        with torch.no_grad(): 
+            length_dataset          = dataloader['resnet_features'].size(0)
+            num_attacked_samples    = 0
+            model_accuracy          = 0
+            model_initial_accuracy  = 0
+            list_diff_img = []
+            
+            # Calculate Adversarial Perturbations
+            pert_grid = torchvision.utils.make_grid(self.e)
+            self.logger.add_image("perturbation_per_class",pert_grid)
+            
+            # Iterate over dataset
+            for i in range(0,length_dataset,batch_size):
+                
+                batch_label   = dataloader['labels'][i:i+batch_size].to(self.device)
+                batch_image   = dataloader['images'][i:i+batch_size].to(self.device)
+                batch_att     = semantic_vector[batch_label].to(self.device)          
+                
+                # True predictions
+                pred = model(batch_image)
+                pred = torch.argmax(pred, 1)
+                attr = model.dazle.package_out['A_p'] * model.dazle.package_out['S_p']
+                if i==0:
+                    cln_log_attn_1 = model.dazle.package_out['A']
+                    cln_log_attn_2 = model.dazle.package_out['A_p']
+
+                # If correctly predicted, we consider it to attack
+                correctly_predicted = (pred == batch_label)
+                batch_label        = batch_label[correctly_predicted]
+                batch_image        = batch_image[correctly_predicted]
+                batch_att          = semantic_vector[batch_label].to(self.device)
+                pred               = pred[correctly_predicted]
+                attr               = attr[correctly_predicted]
+                # Wrong prediction for all batch
+                if correctly_predicted.sum()<=0:
+                    print("wrong prediction for all batch")
+                    continue
+                
+                if i==0:
+                    cln_log_attn_1     = cln_log_attn_1[correctly_predicted]
+                    cln_log_attn_2     = cln_log_attn_2[correctly_predicted]
+
+                correct_batch_size = correctly_predicted.sum()
+                                
+                # Adversarial Perturbation
+                batch_perturbation      = self.e
+
+                
+                batch_adv_image = self.add_perturbation(batch_image.reshape(-1,3,224,224),\
+                                                        batch_perturbation,\
+                                                        normalized_perturbation=normalized_perturbation,\
+                                                        project_perturbation=project_perturbation,
+                                                        scale=True,\
+                                                        norm_p=norm_p,\
+                                                        norm_perturbation=norm_perturbation)
+                
+                # Attack
+                adv_pred = model(batch_adv_image)
+                adv_pred = torch.argmax(adv_pred, 1)
+                adv_attr = model.dazle.package_out['A_p'] * model.dazle.package_out['S_p']
+
+                num_attacked_samples    += correct_batch_size
+                model_accuracy          += (adv_pred == batch_label).float().sum().detach().clone()
+                model_initial_accuracy  += (pred     == batch_label).float().sum().detach().clone()
+                
+                
+                # To log less images
+                if i==0:
+                    adv_title  = [self.class_names.name.tolist()[i] for i in(adv_pred)]
+                    cln_title  = [self.class_names.name.tolist()[i] for i in(batch_label)]
+                    self.image_visualization(inverse_transform(batch_image), inverse_transform(batch_perturbation.repeat(batch_image.size(0),1,1,1)),\
+                                             inverse_transform(batch_adv_image), adv_title, cln_title, attack_scenario, norm_perturbation, norm_p)
+                    self.visualize_attention(images=batch_image, labels=pred, attentions_map=cln_log_attn_1, attentions_attribute=cln_log_attn_2,\
+                                             n_top_attr=5, mode="clean")
+                    
+                    self.visualize_attention(images=batch_adv_image, labels=adv_pred, attentions_map=model.dazle.package_out['A'], attentions_attribute=model.dazle.package_out['A_p'],\
+                                             n_top_attr=5, mode="adv", norm=norm_p)
+
+
+
+
+                diff_img = inverse_transform(batch_image) - inverse_transform(batch_adv_image)        
+                diff_img = diff_img.abs()
+                list_diff_img.append(diff_img) 
+
+
+            tensor_diff_img = torch.cat(list_diff_img, dim=0)
+            avg_per_pixel_perturbation = tensor_diff_img.sum()/tensor_diff_img.size(0)/(224*224)
+            if norm_p==2:
+                self.logger.add_scalar('avg per pixel_L2/'+attack_scenario, avg_per_pixel_perturbation,norm_perturbation)
+                self.logger.add_scalar('true model accuracy_L2/'+attack_scenario, model_accuracy/num_attacked_samples, norm_perturbation)
+                self.logger.add_scalar('true model initial accuracy_L2/'+attack_scenario, model_initial_accuracy/num_attacked_samples, norm_perturbation)
+            else:
+                self.logger.add_scalar('avg per pixel_Linf/'+attack_scenario+'_norm*100', avg_per_pixel_perturbation,norm_perturbation*100)
+                self.logger.add_scalar('true model accuracy_Linf/'+attack_scenario+'_norm*100', model_accuracy/num_attacked_samples, norm_perturbation*100)
+                self.logger.add_scalar('true model initial accuracy_Linf/'+attack_scenario+'_norm*100', model_initial_accuracy/num_attacked_samples, norm_perturbation*100)
+
+            return model_accuracy/num_attacked_samples, model_initial_accuracy/num_attacked_samples
+            
+    def visualize_attention(self, images, labels, attentions_map, attentions_attribute, n_top_attr, mode="clean", norm=0):
+        # print("attn map sizes ",attentions_map.size(),attentions_map[0].size())
+        h = int(attentions_map.size(-1)**0.5)
+        for i in range(min(10,images.size(0))):#(images.size(0)):
+            image   = images[i]
+            label   = labels[i]
+            attn_1  = attentions_map[i]
+            attn_2  = attentions_attribute[i]
+            image   = inverse_transform(image).detach().clone().cpu().permute(1,2,0)
+            fig, ax = plt.subplots(1, n_top_attr+1, figsize=(30,30))
+            ax[0].set_title(self.class_names.name.tolist()[label])
+            ax[0].imshow(image)
+
+            idx_top = torch.argsort(-attn_2)[:n_top_attr]
+            # print("attributes, values",idx_top, attn_2)
+            
+            for idx_ctxt, idx_attr in enumerate(idx_top):
+                ax[idx_ctxt+1].imshow(image)
+                attn_curr   = attn_1[idx_attr,:].reshape(h,h)
+                attn_image  = skimage.transform.pyramid_expand(attn_curr.cpu().detach().clone(), upscale= image.size(0)/h,\
+                                                               sigma=10, multichannel=False)
+                ax[idx_ctxt+1].imshow(attn_image, alpha=0.7)
+                if mode=="clean":
+                    ax[idx_ctxt+1].set_title(str(self.attr_names.name.tolist()[idx_attr])+ "/ "+ str(round(attn_2[idx_attr].item(),2)))
+                else:
+                    ax[idx_ctxt+1].set_title(str(self.attr_names.name.tolist()[idx_attr])+ "/ "+ str(round(attn_2[idx_attr].item(),2))+"/ norm"+str(norm.item()))
+            
+            fig.tight_layout()
+
+            if mode=="clean":
+                self.logger.add_figure("Attentions over Attributes/"+mode,fig,i)
+            else:
+                self.logger.add_figure("Attentions over Attributes/"+mode+"_norm"+str(norm.item()),fig,i)
+            
+            # time.sleep(3)
+
+            fig = plt.figure(figsize=(10,10))
+            plt.bar(torch.arange(attn_2.size(-1)),attn_2.cpu())
+            self.logger.add_figure("Attentions over Attributes/attr_attrn_"+mode+"_norm"+str(norm),fig)
+
+
+            
+
+
+
+
+
+                
+            
+            
+               
+           
+           
